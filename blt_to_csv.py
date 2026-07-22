@@ -1,6 +1,49 @@
 import glob
-import regex as re
 import os
+
+
+def _quoted_parts(candidate):
+    parts = [part.strip() for part in candidate.split('"') if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"Could not parse quoted candidate: {candidate!r}")
+    return parts
+
+
+def _parenthetical_parts(candidate):
+    if candidate.startswith("# ALTERNATIVE NAME"):
+        candidate = candidate.split(":", 1)[1].strip()
+
+    name, separator, party = candidate.rpartition("(")
+    if not separator or not party.endswith(")"):
+        raise ValueError(f"Could not parse candidate: {candidate!r}")
+    name = name.strip()
+    while name.endswith(")"):
+        prefix, separator, _label = name.rpartition("(")
+        if not separator:
+            break
+        name = prefix.strip()
+    return name, party[:-1].strip()
+
+
+def _normalize_party_text(party):
+    party = party.replace("‐", "-")
+    if party.startswith("Scottish Greens") and party.endswith(
+        "Think Global Act Local"
+    ):
+        return "Scottish Greens - Think Global Act Local"
+    return party
+
+
+def _csv_style_name(name):
+    name = name.replace("Ã“", "Ó")
+    name = " ".join(name.split()).title()
+    return "Eòghann MacColl" if name == "Eòghann Maccoll" else name
+
+
+def _ward_name(line):
+    line = line.rstrip(",")
+    parts = [part.strip() for part in line.split('"') if part.strip()]
+    return parts[0] if '"' in line and len(parts) == 1 else line
 
 
 def process_2007_cands(cands):
@@ -21,9 +64,7 @@ def process_2007_cands(cands):
 
     name_party_pairs = []
     for c in cands:
-        name = re.search(r"(?<=:\s)[A-Z,\-,\.,a-z,\s]*", c).group()
-        party = re.search(r"(?<=\()[A-Z,a-z,\s]*(?<!\))", c).group()
-
+        name, party = _parenthetical_parts(c)
         name_party_pairs.append((name, party_dict_2007[party]))
     return name_party_pairs
 
@@ -48,7 +89,7 @@ def process_2012_2017_cands(cands):
         "Glasgow First": "Glasgow First (Glasgow First)",
         "Scottish Socialist": "Socialist (Soc)",
         "SSP": "Socialist (Soc)",
-        "Pir": "Piarate (Pir)",
+        "Pir": "Pirate (Pir)",
         "TUSC": "Trade Unionist and Socialist Coalition (TUSC)",
         "SLP": "Socialist Labour Party (SLP)",
         "SC": "Scottish Christian (SC)",
@@ -82,16 +123,11 @@ def process_2012_2017_cands(cands):
     name_party_pairs = []
 
     for c in cands:
-        name = re.search(r"[A-Z,a-z,\-,\.,\s]*", c)
-        party = re.search(r"(?<=\()[A-Z,a-z,\s]*(?<!\))", c)
-
-        if not name or not party:
-            name = re.search(r"(?<=\"\")[A-Z,a-z,\-,\.,\s]{2,}(?<!\"\")", c)
-            party = re.search(r"(?<=^\")[A-Z,a-z,\s]*(?<!\s\")", c)
-
-        name_party_pairs.append(
-            (name.group(), party_dict_2012_2017[party.group().strip()])
-        )
+        if c.startswith('"'):
+            party, name = _quoted_parts(c)
+        else:
+            name, party = _parenthetical_parts(c)
+        name_party_pairs.append((name, party_dict_2012_2017[party]))
 
     return name_party_pairs
 
@@ -174,49 +210,65 @@ def process_2022_cands(cands):
     name_party_pairs = []
 
     for c in cands:
-        name_and_party = re.findall(r"(?<=\")[A-Z,a-z,\',\.,\-,\(,\),\s]*(?<!\")", c)
-
-        name_and_party = [x for x in name_and_party if x.strip() != ""]
-
-        name = name_and_party[0]
-        party = name_and_party[-1]
-
-        name_party_pairs.append((name, party_dict_2022[party.strip()]))
+        name, party = _quoted_parts(c)
+        party = _normalize_party_text(party)
+        name_party_pairs.append((name, party_dict_2022[party]))
 
     return name_party_pairs
 
 
+def _quoted(value):
+    return '"' + value.replace('"', '""') + '"'
+
+
 def process_file_list(file_list, output_dir, processing_function):
     for file in file_list:
+        file = str(file)
         if "_by_" in file:
             continue
 
-        write_lines = []
+        with open(file, encoding="utf-8-sig") as source:
+            lines = [line.strip() for line in source]
 
-        with open(file, "r") as f:
-            lines = [line.strip("\n").strip() for line in f.readlines()]
-            n_cands = lines[0].split(" ")[0]
-            cands = lines[-int(n_cands) - 1 : -1]
-            first_line = ",".join(lines[0].split(" ")) + ",\n"
-            write_lines.append(first_line)
-            for idx in range(1, len(lines) - int(n_cands) - 2):
-                write_lines.append(
-                    ",".join(lines[idx].rstrip()[:-2].split(" ")) + ",\n"
-                )
+        header = lines[0].rstrip(",").split()
+        n_cands, n_seats = map(int, header)
+        ballot_end = next(
+            idx for idx, line in enumerate(lines[1:], 1) if line.strip(" ,") == "0"
+        )
+        cands = lines[ballot_end + 1 : ballot_end + 1 + n_cands]
+        ward_lines = lines[ballot_end + 1 + n_cands :]
+        if len(cands) != n_cands or len(ward_lines) != 1:
+            raise ValueError(f"Malformed BLT candidate section: {file}")
 
-            for i, (name, party) in enumerate(processing_function(cands)):
-                write_lines.append(
-                    f'"Candidate {i+1}","{name.strip().title()}","{party.strip()}",\n'
-                )
+        write_lines = [",".join(header) + ",\n"]
+        for line in lines[1:ballot_end]:
+            ballot = line.rstrip(",").split()
+            if not ballot or ballot[-1] != "0":
+                raise ValueError(f"Malformed BLT ballot: {file}: {line!r}")
+            write_lines.append(",".join(ballot[:-1]) + ",\n")
 
-            write_lines.append(f'"{lines[-1]}",')
+        for i, (name, party) in enumerate(processing_function(cands), 1):
+            write_lines.append(
+                f'{_quoted(f"Candidate {i}")},{_quoted(_csv_style_name(name))},'
+                f'{_quoted(party.strip())},\n'
+            )
+        write_lines.append(f'{_quoted(_ward_name(ward_lines[0]))},')
+        output = "".join(write_lines)
 
         file_name, _ext = os.path.splitext(os.path.basename(file))
         file_parent = os.path.basename(os.path.dirname(file))
         out_file = os.path.join(output_dir, file_parent, file_name + ".csv")
         print(out_file)
-        with open(out_file, "w") as f:
-            f.writelines(write_lines)
+        os.makedirs(os.path.dirname(out_file), exist_ok=True)
+        with open(out_file, "w", encoding="utf-8", newline="") as destination:
+            destination.write(output)
+
+        seat_file = os.path.join(
+            output_dir, f"{n_seats}_seats", file_name + ".csv"
+        )
+        os.makedirs(os.path.dirname(seat_file), exist_ok=True)
+        with open(seat_file, "w", encoding="utf-8", newline="") as destination:
+            destination.write(output)
 
 
 if __name__ == "__main__":
